@@ -3,38 +3,33 @@ package com.template.flows;
 import co.paralleluniverse.fibers.Suspendable;
 import com.template.contracts.WillContract;
 import com.template.states.WillState;
-import jdk.nashorn.internal.ir.annotations.Ignore;
-import net.corda.core.contracts.Command;
-import net.corda.core.contracts.StateAndRef;
 import net.corda.core.flows.*;
 import net.corda.core.identity.Party;
-import net.corda.core.node.services.Vault;
-import net.corda.core.node.services.vault.IQueryCriteriaParser;
-import net.corda.core.node.services.vault.QueryCriteria;
 import net.corda.core.transactions.SignedTransaction;
 import net.corda.core.transactions.TransactionBuilder;
 import net.corda.core.utilities.ProgressTracker;
-import org.jetbrains.annotations.NotNull;
 
-import javax.persistence.criteria.Predicate;
-import java.util.Collection;
-import java.util.List;
+import java.util.Arrays;
 
 import static com.template.contracts.WillContract.WILL_CONTRACT_ID;
 
-public class GenerateWillFlow {
+public class RequestWillFlow {
 
     @InitiatingFlow
     @StartableByRPC
-    public static class GenerateWillFlowInitiator extends FlowLogic<SignedTransaction>{
+    public static class RequestWillFlowInitiator extends FlowLogic<SignedTransaction>{
 
-        StateAndRef<WillState> matchedState = null;
+        //we do not need the issuer as he is running the flow
         private String willId;
-        private Party owner;
+        private String willType;
+        private String willDetails;
+        private Party verifier;
 
-        public GenerateWillFlowInitiator(String willId, Party owner) {
+        public RequestWillFlowInitiator(String willId, String willType, String willDetails, Party verifier) {
             this.willId = willId;
-            this.owner = owner;
+            this.willType = willType;
+            this.willDetails = willDetails;
+            this.verifier = verifier;
         }
 
         //adding steps to create a trail
@@ -42,7 +37,7 @@ public class GenerateWillFlow {
         private final ProgressTracker.Step RETRIEVING_NOTARY = new ProgressTracker.Step("Retrieving the Notary");
         private final ProgressTracker.Step GENERATING_TRANSACTION = new ProgressTracker.Step("Generating Transaction");
         private final ProgressTracker.Step SIGNING_TRANSACTION = new ProgressTracker.Step("Signing the transaction with private key");
-        private final ProgressTracker.Step COUNTERPARTY_SESSION = new ProgressTracker.Step("Sending the flow to Owner");
+        private final ProgressTracker.Step COUNTERPARTY_SESSION = new ProgressTracker.Step("Sending the flow to Verifier");
         private final ProgressTracker.Step FINALIZING_TRANSACTION = new ProgressTracker.Step("Obtaining Notary signature and committing the transaction");
 
         private final ProgressTracker progresstracker = new ProgressTracker(
@@ -57,31 +52,6 @@ public class GenerateWillFlow {
         @Override
         public ProgressTracker getProgressTracker() {return progresstracker;}
 
-        // Check for existing WillId Starts
-        private StateAndRef<WillState> CheckForWillID() throws FlowException {
-            //Check for all values that are unconsumed in vault
-            QueryCriteria generalCriteria = new QueryCriteria.VaultQueryCriteria(Vault.StateStatus.UNCONSUMED);
-
-            //Get All States of type will state which are unconsumed
-            List<StateAndRef<WillState>> willStates = getServiceHub().getVaultService().queryBy(WillState.class, generalCriteria).getStates();
-            boolean inputFound = false;
-
-            for(int i=0; i < willStates.size(); i++){
-                if(willStates.get(i).getState().getData().getWillId().equals(willId)){
-                    inputFound = true;
-                    matchedState = willStates.get(i);
-                }
-            }
-
-            if(inputFound){
-                System.out.println("\nInput found");
-            }else{
-                System.out.println("\nInput not found");
-                throw new FlowException();
-            }
-            return matchedState;
-        }
-        // Check for existing WillId Ends
         @Override
         @Suspendable
         public SignedTransaction call() throws FlowException {
@@ -89,11 +59,11 @@ public class GenerateWillFlow {
 
             //Do an identity check to restrict the owner
             progresstracker.setCurrentStep(VALIDATING_OWNER);
-            if(getOurIdentity().getName().getOrganisation().equalsIgnoreCase("WillCertifier")) {
+            if(getOurIdentity().getName().getOrganisation().equalsIgnoreCase("WillOwner")) {
                 System.out.println("Identity Verified");
             }
             else{
-                throw new FlowException("Identity only be Will Certifier");
+                throw new FlowException("Identity only be WillOwner");
             }
 
             //***in corda we build transactions using transactionbuilder, we need to notary, command and output state to transaction***
@@ -101,22 +71,15 @@ public class GenerateWillFlow {
             progresstracker.setCurrentStep(RETRIEVING_NOTARY);
             Party notary = getServiceHub().getNetworkMapCache().getNotaryIdentities().get(0);
 
-
             //Create the transaction components(Input and Outputs)
-            //need to create an input state: retrieve from vault
-            StateAndRef<WillState> inputState = CheckForWillID();
+            //create output state, it has 3 fields including verifier for this use case
 
-            //fetch will details and type from input state
-            //WillState outputState = new WillState(this.willId, this.willType, this.willDetails, getOurIdentity(), this.owner);
-            WillState outputState = new WillState(this.willId, inputState.getState().getData().getWillType(), inputState.getState().getData().getWillDetails(), "Will Generated", getOurIdentity(), this.owner);
-            Command cmd = new Command(new WillContract.GenerateWill(), getOurIdentity().getOwningKey());
+            WillState outputState = new WillState(this.willId, this.willType, this.willDetails,"Verification Requested",  getOurIdentity(), this.verifier);
 
             progresstracker.setCurrentStep(GENERATING_TRANSACTION);
             TransactionBuilder txbuilder = new TransactionBuilder(notary);
             txbuilder.addOutputState(outputState, WILL_CONTRACT_ID);
-            txbuilder.addCommand(cmd);
-
-            txbuilder.addInputState(inputState);
+            txbuilder.addCommand(new WillContract.RequestWill(), getOurIdentity().getOwningKey());
 
             //Signing the transaction
             progresstracker.setCurrentStep(SIGNING_TRANSACTION);
@@ -125,9 +88,11 @@ public class GenerateWillFlow {
             //Send transaction to counterparty, communication is done using session
             //Create session with counterparty
             progresstracker.setCurrentStep(COUNTERPARTY_SESSION);
-            FlowSession otherPartySession = initiateFlow(owner);
-            //FlowSession verifierPartySession = initiateFlow(issuer);
+            FlowSession otherPartySession = initiateFlow(verifier);
 
+            /*// Obtaining the counterparty's signature.
+            SignedTransaction fullySignedTx = subFlow(new CollectSignaturesFlow(
+                    willTx, Arrays.asList(otherPartySession), CollectSignaturesFlow.Companion.tracker()));*/
 
             //Verify transaction and send to Notary amd once it's done commit the transaction(can be done using subflow to finalize the transaction)
             //Finalize the transaction
@@ -138,7 +103,7 @@ public class GenerateWillFlow {
 
 
 
-    @InitiatedBy(GenerateWillFlowInitiator.class)
+    @InitiatedBy(RequestWillFlowInitiator.class)
     public static class GenerateWillFlowResponder extends FlowLogic<SignedTransaction>{
         //private variable
         private FlowSession otherPartySession;
@@ -151,7 +116,7 @@ public class GenerateWillFlow {
         @Suspendable
         @Override
         public SignedTransaction call() throws FlowException {
-               System.out.println("Verified and updated the requested Will");
+               System.out.println("Received Will request for verification");
                return subFlow(new ReceiveFinalityFlow(otherPartySession));
         }
     }
